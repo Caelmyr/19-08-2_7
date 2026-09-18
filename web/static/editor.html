@@ -151,6 +151,50 @@
     align-items: center;
     gap: 6px;
   }
+
+  /* 文档被删除时的遮罩提示 */
+  .deleted-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(26, 26, 46, 0.55);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  .deleted-overlay.show { display: flex; }
+  .deleted-dialog {
+    background: white;
+    border-radius: 16px;
+    padding: 40px;
+    max-width: 440px;
+    text-align: center;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  }
+  .deleted-dialog .icon { font-size: 56px; margin-bottom: 16px; }
+  .deleted-dialog h2 {
+    font-size: 20px;
+    color: #1a1a2e;
+    margin-bottom: 12px;
+  }
+  .deleted-dialog p {
+    color: #666;
+    font-size: 14px;
+    line-height: 1.7;
+    margin-bottom: 24px;
+  }
+  .deleted-dialog .btn {
+    padding: 10px 24px;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    margin: 0 6px;
+  }
+  .deleted-dialog .btn-primary { background: #4361ee; color: white; }
+  .deleted-dialog .btn-secondary { background: #e8ecf1; color: #333; }
+  #editor.deleted { background: #f0f0f3; color: #999; }
 </style>
 </head>
 <body>
@@ -188,6 +232,17 @@
   <div>CoEdit OT 实时协作引擎</div>
 </div>
 
+<!-- 文档被删除时的提示遮罩 -->
+<div class="deleted-overlay" id="deletedOverlay">
+  <div class="deleted-dialog">
+    <div class="icon">🗑️</div>
+    <h2>文档已被删除</h2>
+    <p id="deletedMessage">该文档已被删除并移入回收站，编辑已停止。<br>可在回收站中恢复（内容与历史版本完整保留）。</p>
+    <button class="btn btn-secondary" onclick="window.location.href='/trash.html'">前往回收站</button>
+    <button class="btn btn-primary" onclick="window.location.href='/'">返回文档列表</button>
+  </div>
+</div>
+
 <script>
 // ========== 状态管理 ==========
 const params = new URLSearchParams(window.location.search);
@@ -206,6 +261,7 @@ let state = {
   reconnectAttempts: 0,
   pendingOps: [],   // 本地已发送但未ack的操作
   sendTimer: null,
+  deleted: false,   // 文档已被删除（进入回收站），停止一切编辑与重连
 };
 
 const editor = document.getElementById('editor');
@@ -234,18 +290,51 @@ async function init() {
 async function loadDocument() {
   try {
     const res = await fetch(`/api/documents/${docId}/snapshot`);
+    if (res.status === 404) {
+      showDeletedDialog('该文档不存在或已被删除并移入回收站。');
+      return;
+    }
     const data = await res.json();
     state.content = data.content || '';
     state.version = data.version || 0;
     editor.value = state.content;
     versionEl.textContent = state.version;
-    
+
     // 获取文档标题
     const docRes = await fetch(`/api/documents/${docId}`);
+    if (docRes.status === 404) {
+      showDeletedDialog('该文档不存在或已被删除并移入回收站。');
+      return;
+    }
     const docData = await docRes.json();
     docTitle.textContent = docData.title || '未命名文档';
   } catch (e) {
     console.error('加载文档失败:', e);
+  }
+}
+
+// ========== 文档删除处理 ==========
+function showDeletedDialog(message) {
+  if (state.deleted) return;
+  state.deleted = true;
+
+  // 明确停止编辑：禁用输入框
+  editor.disabled = true;
+  editor.classList.add('deleted');
+
+  // 停止光标监听渲染
+  statusEl.className = 'status-indicator disconnected';
+  statusText.textContent = '文档已删除';
+  docTitle.textContent = '文档已删除';
+
+  if (message) {
+    document.getElementById('deletedMessage').textContent = message;
+  }
+  document.getElementById('deletedOverlay').classList.add('show');
+
+  // 关闭WebSocket，且不再自动重连
+  if (state.ws) {
+    try { state.ws.close(); } catch (e) {}
   }
 }
 
@@ -265,6 +354,12 @@ function connectWS() {
   
   state.ws.onclose = () => {
     console.log('WebSocket 断开');
+    if (state.deleted) {
+      // 文档被删除后由服务端主动断开，不再重连
+      statusEl.className = 'status-indicator disconnected';
+      statusText.textContent = '文档已删除';
+      return;
+    }
     statusEl.className = 'status-indicator disconnected';
     statusText.textContent = '重连中...';
     // 自动重连
@@ -306,8 +401,15 @@ function onMessage(event) {
       case 'user_leave':
         handleUserLeave(msg);
         break;
+      case 'doc_deleted':
+        // 文档被删除：明确提示并停止编辑
+        showDeletedDialog(msg.error || msg.content || '该文档已被删除并移入回收站。');
+        break;
       case 'error':
         console.error('服务器错误:', msg.error);
+        if (msg.error && msg.error.indexOf('document not found') !== -1) {
+          showDeletedDialog('该文档已被删除并移入回收站。');
+        }
         break;
     }
   } catch (e) {
@@ -494,6 +596,7 @@ function getCaretCoordinates(element, position) {
 
 // ========== 编辑器操作 ==========
 function onInput(e) {
+  if (state.deleted) return; // 文档已删除，停止接受任何编辑
   // 计算差异，发送OT操作
   const newContent = editor.value;
   const oldContent = state.content;

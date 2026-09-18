@@ -16,15 +16,16 @@ import (
 type MessageType string
 
 const (
-	MsgOp         MessageType = "op"         // 操作消息
-	MsgAck        MessageType = "ack"        // 操作确认
-	MsgCursors    MessageType = "cursors"    // 光标位置广播
+	MsgOp         MessageType = "op"          // 操作消息
+	MsgAck        MessageType = "ack"         // 操作确认
+	MsgCursors    MessageType = "cursors"     // 光标位置广播
 	MsgCursorMove MessageType = "cursor_move" // 光标移动
-	MsgUserJoin   MessageType = "user_join"  // 用户加入
-	MsgUserLeave  MessageType = "user_leave" // 用户离开
-	MsgInit       MessageType = "init"       // 初始化消息
-	MsgError      MessageType = "error"      // 错误消息
-	MsgSnapshot   MessageType = "snapshot"   // 快照请求
+	MsgUserJoin   MessageType = "user_join"   // 用户加入
+	MsgUserLeave  MessageType = "user_leave"  // 用户离开
+	MsgInit       MessageType = "init"        // 初始化消息
+	MsgError      MessageType = "error"       // 错误消息
+	MsgSnapshot   MessageType = "snapshot"    // 快照请求
+	MsgDocDeleted MessageType = "doc_deleted" // 文档被删除（移入回收站）
 )
 
 // Message WebSocket消息
@@ -42,6 +43,7 @@ type Message struct {
 	Position  int         `json:"position,omitempty"`
 	Color     string      `json:"color,omitempty"`
 	Error     string      `json:"error,omitempty"`
+	Title     string      `json:"title,omitempty"`
 	Timestamp time.Time   `json:"timestamp,omitempty"`
 }
 
@@ -62,15 +64,43 @@ type Cursor struct {
 
 // Client 表示一个WebSocket连接
 type Client struct {
-	Hub      *Hub
-	RoomID   string
-	ClientID string
-	Username string
-	Color    string
-	Position int
-	Conn     *websocket.Conn
-	Send     chan []byte
-	mu       sync.Mutex
+	Hub       *Hub
+	RoomID    string
+	ClientID  string
+	Username  string
+	Color     string
+	Position  int
+	Conn      *websocket.Conn
+	Send      chan []byte
+	mu        sync.Mutex
+	closed    bool
+	closeOnce sync.Once
+}
+
+// Close 幂等地关闭发送通道。通道关闭后 WritePump 会主动断开WebSocket连接。
+// 多个调用方（正常离开、房间被强制关闭）并发调用也是安全的。
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		c.mu.Unlock()
+		close(c.Send)
+	})
+}
+
+// trySend 非阻塞地向发送通道投递数据；通道已关闭时返回false而不会panic。
+func (c *Client) trySend(data []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return false
+	}
+	select {
+	case c.Send <- data:
+		return true
+	default:
+		return false
+	}
 }
 
 // Room 表示一个文档房间
@@ -161,7 +191,7 @@ func (h *Hub) removeClient(client *Client) {
 	room.mu.Lock()
 	if _, ok := room.Clients[client.ClientID]; ok {
 		delete(room.Clients, client.ClientID)
-		close(client.Send)
+		client.Close()
 	}
 	isEmpty := len(room.Clients) == 0
 	room.mu.Unlock()
@@ -242,6 +272,43 @@ func (h *Hub) BroadcastCursors(roomID string, senderID string, cursorMsg Message
 		Message: data,
 		Except:  senderID,
 	}
+}
+
+// BroadcastToAll 向房间内所有客户端广播（包括发送者）。
+// 用于文档删除等需要每个在线用户都收到的系统通知。
+func (h *Hub) BroadcastToAll(roomID string, m Message) {
+	data, _ := json.Marshal(m)
+	h.Broadcast <- &BroadcastMessage{
+		RoomID:  roomID,
+		Message: data,
+	}
+}
+
+// ForceCloseRoom 强制关闭某个文档房间：断开所有在线用户的连接并移除房间。
+// 调用方应在广播 doc_deleted 通知后稍作延迟再调用，给消息留出投递时间。
+func (h *Hub) ForceCloseRoom(roomID string) {
+	h.mu.Lock()
+	room, exists := h.Rooms[roomID]
+	if exists {
+		delete(h.Rooms, roomID)
+	}
+	h.mu.Unlock()
+	if !exists {
+		return
+	}
+
+	// 持有房间锁时关闭客户端，与 broadcast 的发送操作互斥，
+	// 避免向已关闭的 Send 通道写入导致panic
+	room.mu.Lock()
+	n := 0
+	for _, c := range room.Clients {
+		c.Close()
+		n++
+	}
+	room.Clients = make(map[string]*Client)
+	room.mu.Unlock()
+
+	log.Printf("[Hub] Room %s force-closed, %d client(s) disconnected", roomID, n)
 }
 
 // GetRoomUsers 获取房间内所有用户信息

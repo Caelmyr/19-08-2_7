@@ -3,6 +3,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -41,13 +42,18 @@ func NewDB(cfg Config) (*sql.DB, error) {
 
 // Document 文档实体
 type Document struct {
-	ID             string    `json:"id"`
-	Title          string    `json:"title"`
-	ContentSnapshot string   `json:"content_snapshot"`
-	CurrentVersion int64     `json:"current_version"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID              string     `json:"id"`
+	Title           string     `json:"title"`
+	ContentSnapshot string     `json:"content_snapshot"`
+	CurrentVersion  int64      `json:"current_version"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
 }
+
+// ErrDocumentNotFound 文档不存在
+var ErrDocumentNotFound = errors.New("document not found")
 
 // OperationRecord 操作日志记录
 type OperationRecord struct {
@@ -85,13 +91,15 @@ func (s *Store) CreateDocument(id, title string) (*Document, error) {
 	return s.GetDocument(id)
 }
 
-// GetDocument 获取文档
+// GetDocument 获取文档（回收站中的文档视为不存在）
 func (s *Store) GetDocument(id string) (*Document, error) {
 	var doc Document
 	err := s.db.QueryRow(
-		"SELECT id, title, COALESCE(content_snapshot,''), current_version, created_at, updated_at FROM documents WHERE id = ?",
+		"SELECT id, title, COALESCE(content_snapshot,''), current_version, created_at, updated_at, deleted_at, expires_at "+
+			"FROM documents WHERE id = ? AND deleted_at IS NULL",
 		id,
-	).Scan(&doc.ID, &doc.Title, &doc.ContentSnapshot, &doc.CurrentVersion, &doc.CreatedAt, &doc.UpdatedAt)
+	).Scan(&doc.ID, &doc.Title, &doc.ContentSnapshot, &doc.CurrentVersion, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.DeletedAt, &doc.ExpiresAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -101,10 +109,11 @@ func (s *Store) GetDocument(id string) (*Document, error) {
 	return &doc, nil
 }
 
-// ListDocuments 列出所有文档
+// ListDocuments 列出所有未删除的文档
 func (s *Store) ListDocuments() ([]Document, error) {
 	rows, err := s.db.Query(
-		"SELECT id, title, current_version, created_at, updated_at FROM documents ORDER BY updated_at DESC",
+		"SELECT id, title, current_version, created_at, updated_at, deleted_at, expires_at " +
+			"FROM documents WHERE deleted_at IS NULL ORDER BY updated_at DESC",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list documents: %w", err)
@@ -114,13 +123,105 @@ func (s *Store) ListDocuments() ([]Document, error) {
 	var docs []Document
 	for rows.Next() {
 		var doc Document
-		err := rows.Scan(&doc.ID, &doc.Title, &doc.CurrentVersion, &doc.CreatedAt, &doc.UpdatedAt)
+		err := rows.Scan(&doc.ID, &doc.Title, &doc.CurrentVersion, &doc.CreatedAt, &doc.UpdatedAt,
+			&doc.DeletedAt, &doc.ExpiresAt)
 		if err != nil {
 			return nil, fmt.Errorf("scan document: %w", err)
 		}
 		docs = append(docs, doc)
 	}
 	return docs, rows.Err()
+}
+
+// ListTrash 列出回收站中的文档（按删除时间倒序）
+func (s *Store) ListTrash() ([]Document, error) {
+	rows, err := s.db.Query(
+		"SELECT id, title, current_version, created_at, updated_at, deleted_at, expires_at " +
+			"FROM documents WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list trash: %w", err)
+	}
+	defer rows.Close()
+
+	var docs []Document
+	for rows.Next() {
+		var doc Document
+		err := rows.Scan(&doc.ID, &doc.Title, &doc.CurrentVersion, &doc.CreatedAt, &doc.UpdatedAt,
+			&doc.DeletedAt, &doc.ExpiresAt)
+		if err != nil {
+			return nil, fmt.Errorf("scan trash document: %w", err)
+		}
+		docs = append(docs, doc)
+	}
+	return docs, rows.Err()
+}
+
+// SoftDelete 将文档移入回收站。
+// 只更新 deleted_at/expires_at，文档快照、版本号和 operations 历史全部保留。
+// 返回 true 表示该文档原本处于未删除状态；false 表示文档不存在或已在回收站。
+func (s *Store) SoftDelete(id string, ttl time.Duration) (bool, error) {
+	now := time.Now()
+	res, err := s.db.Exec(
+		"UPDATE documents SET deleted_at = ?, expires_at = ? WHERE id = ? AND deleted_at IS NULL",
+		now, now.Add(ttl), id,
+	)
+	if err != nil {
+		return false, fmt.Errorf("soft delete document: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
+// Restore 从回收站恢复文档（清空删除标记，快照、内容和历史版本原样保留）。
+// 返回 true 表示恢复成功；false 表示文档不存在或不在回收站。
+func (s *Store) Restore(id string) (bool, error) {
+	res, err := s.db.Exec(
+		"UPDATE documents SET deleted_at = NULL, expires_at = NULL, updated_at = NOW() "+
+			"WHERE id = ? AND deleted_at IS NOT NULL",
+		id,
+	)
+	if err != nil {
+		return false, fmt.Errorf("restore document: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
+// Purge 彻底删除回收站中的单个文档（级联删除 operations 历史）。
+// 返回 true 表示删除成功；false 表示文档不存在或不在回收站。
+func (s *Store) Purge(id string) (bool, error) {
+	res, err := s.db.Exec("DELETE FROM documents WHERE id = ? AND deleted_at IS NOT NULL", id)
+	if err != nil {
+		return false, fmt.Errorf("purge document: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
+// PurgeExpired 物理删除回收站中已到期的文档。
+// 清理时机 = expires_at，即“删除时间 + 保留时长”。
+func (s *Store) PurgeExpired() (int64, error) {
+	res, err := s.db.Exec(
+		"DELETE FROM documents WHERE deleted_at IS NOT NULL AND expires_at IS NOT NULL AND expires_at <= NOW()",
+	)
+	if err != nil {
+		return 0, fmt.Errorf("purge expired documents: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return affected, nil
 }
 
 // UpdateSnapshot 更新文档快照（在checkpoint时调用）

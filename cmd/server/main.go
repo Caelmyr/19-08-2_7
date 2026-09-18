@@ -2,11 +2,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -16,12 +18,13 @@ import (
 )
 
 var (
-	port     = flag.String("port", "8080", "HTTP server port")
-	dbHost   = flag.String("db-host", "localhost", "MySQL host")
-	dbPort   = flag.Int("db-port", 3306, "MySQL port")
-	dbUser   = flag.String("db-user", "root", "MySQL user")
-	dbPass   = flag.String("db-pass", "root", "MySQL password")
-	dbName   = flag.String("db-name", "coedit", "MySQL database name")
+	port      = flag.String("port", "8080", "HTTP server port")
+	dbHost    = flag.String("db-host", "localhost", "MySQL host")
+	dbPort    = flag.Int("db-port", 3306, "MySQL port")
+	dbUser    = flag.String("db-user", "root", "MySQL user")
+	dbPass    = flag.String("db-pass", "root", "MySQL password")
+	dbName    = flag.String("db-name", "coedit", "MySQL database name")
+	trashDays = flag.Int("trash-retention-days", 30, "回收站文档保留天数，超过后自动彻底删除")
 )
 
 func main() {
@@ -47,6 +50,10 @@ func main() {
 	go hub.Run()
 
 	server := api.NewServer(db, st, hub)
+	server.TrashTTL = time.Duration(*trashDays) * 24 * time.Hour
+
+	// 回收站自动清理：超过保留期的文档被物理删除
+	go server.StartTrashCleaner(context.Background())
 
 	// 创建默认文档
 	if err := ensureDefaultDoc(st); err != nil {
@@ -60,6 +67,43 @@ func main() {
 	mux.Handle("/", http.FileServer(http.Dir("web/static")))
 
 	// API路由
+	mux.HandleFunc("/api/trash", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		server.ListTrash(w, r)
+	})
+
+	mux.HandleFunc("/api/trash/", func(w http.ResponseWriter, r *http.Request) {
+		// 子路由: /api/trash/{id}/restore
+		path := r.URL.Path[len("/api/trash/"):]
+		switch {
+		case path == "":
+			if r.Method == http.MethodGet {
+				server.ListTrash(w, r)
+			} else {
+				http.Error(w, "method not allowed", 405)
+			}
+			return
+		case hasSuffix(path, "/restore"):
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", 405)
+				return
+			}
+			docID := path[:len(path)-len("/restore")]
+			server.RestoreTrashItem(w, r, docID)
+			return
+		default:
+			// /api/trash/{id} 彻底删除
+			if r.Method != http.MethodDelete {
+				http.Error(w, "method not allowed", 405)
+				return
+			}
+			server.PurgeTrashItem(w, r, path)
+		}
+	})
+
 	mux.HandleFunc("/api/documents", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case "GET":

@@ -4,6 +4,7 @@ package api
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -27,6 +28,9 @@ type Server struct {
 	Hub      *ws.Hub
 	upgrader websocket.Upgrader
 
+	// TrashTTL 文档在回收站中的保留时长，超过后自动彻底删除
+	TrashTTL time.Duration
+
 	// 内存中的文档状态缓存（用于实时OT）
 	// 生产环境应该用分布式锁，单机用内存map就行
 	docStates map[string]*DocState
@@ -35,11 +39,11 @@ type Server struct {
 
 // DocState 文档的运行时状态
 type DocState struct {
-	ID        string
-	Content   string
-	Version   int64
-	Ops       []ot.Operation // 版本号从1开始，ops[0]对应version=1
-	mu        sync.Mutex
+	ID      string
+	Content string
+	Version int64
+	Ops     []ot.Operation // 版本号从1开始，ops[0]对应version=1
+	mu      sync.Mutex
 }
 
 // NewServer 创建服务端
@@ -54,6 +58,8 @@ func NewServer(db *sql.DB, st *store.Store, hub *ws.Hub) *Server {
 			CheckOrigin:     func(r *http.Request) bool { return true },
 		},
 		docStates: make(map[string]*DocState),
+		// 默认回收站保留30天
+		TrashTTL: 30 * 24 * time.Hour,
 	}
 }
 
@@ -72,7 +78,8 @@ func (s *Server) getOrLoadDocState(docID string) (*DocState, error) {
 		return nil, err
 	}
 	if doc == nil {
-		return nil, fmt.Errorf("document not found: %s", docID)
+		// 文档不存在或已被移入回收站
+		return nil, store.ErrDocumentNotFound
 	}
 
 	state = &DocState{
@@ -187,17 +194,98 @@ func (s *Server) GetDocumentByID(w http.ResponseWriter, r *http.Request, id stri
 	writeJSON(w, 200, doc)
 }
 
-// DeleteDocumentByID 按ID删除文档
+// DeleteDocumentByID 按ID删除文档（软删除：移入回收站，不直接消失）
 func (s *Server) DeleteDocumentByID(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := s.DB.Exec("DELETE FROM documents WHERE id = ?", id)
+	s.softDelete(w, id)
+}
+
+// softDelete 将文档移入回收站，并通知房间内所有正在编辑的用户
+func (s *Server) softDelete(w http.ResponseWriter, id string) {
+	// 先取标题，用于通知文案
+	doc, err := s.Store.GetDocument(id)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
+		return
+	}
+	if doc == nil {
+		http.Error(w, "document not found", 404)
+		return
+	}
+	title := doc.Title
+
+	deleted, err := s.Store.SoftDelete(id, s.TrashTTL)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if !deleted {
+		http.Error(w, "document not found", 404)
+		return
+	}
+
+	// 清理内存中的OT状态。恢复后会从数据库重新加载，内容和历史版本完整保留
+	s.mu.Lock()
+	delete(s.docStates, id)
+	s.mu.Unlock()
+
+	// 通知所有正在编辑该文档的在线用户：文档已被删除，必须停止编辑
+	s.Hub.BroadcastToAll(id, ws.Message{
+		Type:      ws.MsgDocDeleted,
+		DocID:     id,
+		Title:     title,
+		Error:     "文档「" + title + "」已被删除，编辑已停止。可在回收站中恢复。",
+		Content:   "文档已被删除，编辑已停止。可在回收站中恢复。",
+		Timestamp: time.Now(),
+	})
+
+	// 延迟强制关闭房间，确保删除通知先投递到客户端
+	go func(roomID string) {
+		time.Sleep(1500 * time.Millisecond)
+		s.Hub.ForceCloseRoom(roomID)
+	}(id)
+
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
+}
+
+// ListTrash 回收站列表：显示标题和删除时间
+func (s *Server) ListTrash(w http.ResponseWriter, r *http.Request) {
+	docs, err := s.Store.ListTrash()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, 200, docs)
+}
+
+// RestoreTrashItem 从回收站恢复文档，内容和历史版本一并完整恢复
+func (s *Server) RestoreTrashItem(w http.ResponseWriter, r *http.Request, id string) {
+	restored, err := s.Store.Restore(id)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if !restored {
+		http.Error(w, "document not found in trash", 404)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"id": id, "status": "restored"})
+}
+
+// PurgeTrashItem 彻底删除回收站中的单个文档
+func (s *Server) PurgeTrashItem(w http.ResponseWriter, r *http.Request, id string) {
+	purged, err := s.Store.Purge(id)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if !purged {
+		http.Error(w, "document not found in trash", 404)
 		return
 	}
 	s.mu.Lock()
 	delete(s.docStates, id)
 	s.mu.Unlock()
-	writeJSON(w, 200, map[string]string{"status": "deleted"})
+	writeJSON(w, 200, map[string]string{"id": id, "status": "purged"})
 }
 
 // GetDocumentSnapshotByID 按ID获取快照
@@ -205,6 +293,10 @@ func (s *Server) GetDocumentSnapshotByID(w http.ResponseWriter, r *http.Request,
 
 	state, err := s.getOrLoadDocState(id)
 	if err != nil {
+		if errors.Is(err, store.ErrDocumentNotFound) {
+			http.Error(w, "document not found", 404)
+			return
+		}
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -215,9 +307,9 @@ func (s *Server) GetDocumentSnapshotByID(w http.ResponseWriter, r *http.Request,
 	state.mu.Unlock()
 
 	writeJSON(w, 200, map[string]interface{}{
-		"doc_id":   id,
-		"content":  content,
-		"version":  version,
+		"doc_id":  id,
+		"content": content,
+		"version": version,
 	})
 }
 
@@ -243,6 +335,10 @@ func (s *Server) GetOperationsByID(w http.ResponseWriter, r *http.Request, id st
 func (s *Server) GetVersionHistoryByID(w http.ResponseWriter, r *http.Request, id string) {
 	state, err := s.getOrLoadDocState(id)
 	if err != nil {
+		if errors.Is(err, store.ErrDocumentNotFound) {
+			http.Error(w, "document not found", 404)
+			return
+		}
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -274,6 +370,10 @@ func (s *Server) RollbackDocumentByID(w http.ResponseWriter, r *http.Request, id
 
 	state, err := s.getOrLoadDocState(id)
 	if err != nil {
+		if errors.Is(err, store.ErrDocumentNotFound) {
+			http.Error(w, "document not found", 404)
+			return
+		}
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -347,6 +447,10 @@ func (s *Server) GetVersionHistory(w http.ResponseWriter, r *http.Request) {
 
 	state, err := s.getOrLoadDocState(id)
 	if err != nil {
+		if errors.Is(err, store.ErrDocumentNotFound) {
+			http.Error(w, "document not found", 404)
+			return
+		}
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -381,6 +485,10 @@ func (s *Server) RollbackDocument(w http.ResponseWriter, r *http.Request) {
 
 	state, err := s.getOrLoadDocState(id)
 	if err != nil {
+		if errors.Is(err, store.ErrDocumentNotFound) {
+			http.Error(w, "document not found", 404)
+			return
+		}
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -428,23 +536,11 @@ func (s *Server) RollbackDocument(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// DeleteDocument 删除文档
+// DeleteDocument 删除文档（软删除：移入回收站）
 func (s *Server) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/documents/")
-
-	// 删除数据库记录
-	_, err := s.DB.Exec("DELETE FROM documents WHERE id = ?", id)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	// 清理内存状态
-	s.mu.Lock()
-	delete(s.docStates, id)
-	s.mu.Unlock()
-
-	writeJSON(w, 200, map[string]string{"status": "deleted"})
+	id = strings.TrimSuffix(id, "/")
+	s.softDelete(w, id)
 }
 
 // ============================================================

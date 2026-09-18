@@ -131,12 +131,8 @@ func (c *Client) SendMessage(msg Message) error {
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	select {
-	case c.Send <- data:
-		return nil
-	default:
+	if !c.trySend(data) {
 		return ErrSendBufferFull
 	}
+	return nil
 }

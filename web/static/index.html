@@ -89,11 +89,32 @@
     color: #999;
   }
   .empty-state-icon { font-size: 48px; margin-bottom: 16px; }
+
+  .top-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+  }
+  .trash-link {
+    color: #666;
+    text-decoration: none;
+    font-size: 14px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    background: white;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    transition: all 0.2s;
+  }
+  .trash-link:hover { color: #4361ee; }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>📝 CoEdit</h1>
+  <div class="top-bar">
+    <h1>📝 CoEdit</h1>
+    <a href="/trash.html" class="trash-link">🗑️ 回收站</a>
+  </div>
   <p class="subtitle">多人协作文档编辑服务 - 实时同步、冲突解决、版本历史</p>
   
   <div class="new-doc-form">
@@ -147,8 +168,12 @@ async function createDocument() {
 }
 
 async function deleteDocument(id) {
-  if (!confirm('确定删除这个文档吗？')) return;
-  await fetch(`/api/documents/${id}`, { method: 'DELETE' });
+  if (!confirm('确定删除这个文档吗？\n删除后文档将移入回收站，可在回收站恢复或彻底删除。')) return;
+  const res = await fetch(`/api/documents/${id}`, { method: 'DELETE' });
+  if (!res.ok) {
+    alert('删除失败：' + (await res.text()));
+    return;
+  }
   loadDocuments();
 }
 

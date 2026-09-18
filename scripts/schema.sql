@@ -13,7 +13,11 @@ CREATE TABLE documents (
     current_version BIGINT NOT NULL DEFAULT 0 COMMENT '当前版本号',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_version (current_version)
+    deleted_at DATETIME NULL DEFAULT NULL COMMENT '删除时间（进入回收站时间），NULL表示未删除',
+    expires_at DATETIME NULL DEFAULT NULL COMMENT '回收站自动彻底删除时间，NULL表示不在回收站',
+    INDEX idx_version (current_version),
+    INDEX idx_deleted_at (deleted_at),
+    INDEX idx_expires_at (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文档表';
 
 -- 操作日志表：append-only的操作序列，支持增量同步和版本回滚
